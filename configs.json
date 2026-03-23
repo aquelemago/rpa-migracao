@@ -1,0 +1,25 @@
+{
+    "drive_letter": "D",
+    "ambientes": {
+        "ead": {
+            "ativo": false,
+            "url_login": "https://ead.portalescudo.com.br/lms/#/login",
+            "url_listagem": "https://ead.portalescudo.com.br/lms/#/admin/usuarioCertificado/listagem",
+            "credenciais": {
+                "login": "lucas.silva@sistemaescudo.com.br",
+                "senha": "LUXmtz4325"
+            },
+            "unidades": ["XXXX", "XXXX"]
+        },
+        "ava": {
+            "ativo": true,
+            "url_login": "https://ava.portalescudo.com.br/lms/#/login",
+            "url_listagem": "https://ava.portalescudo.com.br/lms/#/admin/usuarioCertificado/listagem",
+            "credenciais": {
+                "login": "lucas.silva@sistemaescudo.com.br",
+                "senha": "LUXmtz4325a?"
+            },
+            "unidades": ["566"]
+        }
+    }
+}
