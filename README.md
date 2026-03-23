@@ -1,73 +1,82 @@
-# Documentação Técnica: Bot de Automação de Migração de Certificados
+# Bot de Automação: Extração de Certificados LMS Konviva
 
-Este documento descreve o funcionamento, a arquitetura e as regras de negócio do robô de RPA (Robotic Process Automation) desenvolvido para a extração e organização de certificados do portal LMS Konviva.
-
----
-
-## 1. Escopo e Objetivo
-O robô foi projetado para realizar o download massivo de certificados de forma resiliente, garantindo que **100% dos registros** disponíveis no sistema sejam baixados e organizados localmente sem intervenção humana.
-
-### Melhorias Implementadas (Contexto Atual):
-- **Auditoria Física de Arquivos**: O robô não confia apenas no clique; ele conta fisicamente quantos PDFs existem na sua pasta antes e depois de cada download. O avanço de página só ocorre se o saldo de arquivos no HD bater com o número de registros selecionados.
-- **Meta Dinâmica por Página**: O bot calcula automaticamente quantos registros existem em cada tela (ex: 100, 50 ou 28 na última página) através do texto informativo da tabela, garantindo precisão matemática em cada lote.
-- **Hierarquia de Pastas (Árvore Organizacional)**: Organização automática de pastas seguindo a estrutura Pai > Filho > Neto do sistema original.
-- **Extração e Limpeza Automática**: Baixa arquivos ZIP, extrai os PDFs soltos para a pasta da unidade e deleta os arquivos ZIP temporários imediatamente.
-- **Supressão de Interrupções do Chrome**: Configuração de RPA para permitir múltiplos downloads automáticos sem exibir popups de confirmação do navegador.
-- **Logs Limpos e Técnicos**: Mensagens de log em texto simples (sem emojis) para melhor compatibilidade com diferentes terminais e maior clareza visual.
-- **Segurança contra Fechamento Súbito**: Em caso de erro fatal, o bot imprime o diagnóstico técnico completo e mantém a janela do navegador aberta por 60 segundos antes de encerrar, permitindo a inspeção da falha.
+Este robô de RPA (Robotic Process Automation) foi desenvolvido para realizar o download massivo, auditado e organizado de certificados do portal LMS Konviva. Ele garante 100% de integridade dos dados através de um sistema de auditoria física e lógica.
 
 ---
 
-## 2. Fluxo de Execução Detalhado
+## 🚀 Funcionalidades Principais
 
-1.  **Configuração Inicial**: Carrega credenciais e URLs do `configs.json`. Inicializa o Selenium com preferências de download automático.
-2.  **Autenticação**: Realiza o login e trata possíveis redirecionamentos automáticos para o dashboard, garantindo a chegada na página de certificados.
-3.  **Mapeamento de Unidades**: Expande recursivamente toda a árvore organizacional e identifica os IDs das unidades alvo (ou captura todas, se a lista estiver vazia).
-4.  **Processamento de Unidade (Auditoria Tripla)**:
-    - **Passo A**: Verifica se a unidade possui registros e reconstrói o caminho das pastas localmente.
-    - **Passo B (Loop de Páginas)**:
-        1. Identifica a meta da página atual (ex: registros 201 a 300 = meta 100).
-        2. Seleciona os checkboxes e aguarda a renderização completa.
-        3. Realiza o download do ZIP e extrai os PDFs.
-        4. Compara o número de novos arquivos no HD com a meta calculada.
-    - **Passo C**: Se a auditoria falhar, repete a mesma página. Se tiver sucesso, salva o checkpoint e avança.
-5.  **Consolidação**: Ao final de todas as unidades, agrupa toda a estrutura de pastas em um arquivo único `Certificados_Final_Hierarquico.zip`.
+- **Auditoria Física Real**: O robô valida o sucesso do download contando os PDFs dentro dos arquivos ZIP antes de avançar para a próxima página. Se houver divergência, a operação é repetida automaticamente.
+- **Compatibilidade Chrome 117+**: Utiliza comandos **CDP (Chrome DevTools Protocol)** para forçar o download direto em modo incôgnito, ignorando restrições recentes do navegador.
+- **Organização Hierárquica**: Reconstrói automaticamente a estrutura de pastas (Pai > Filho > Neto) conforme a árvore organizacional do sistema.
+- **Sistema de Checkpoint**: Salva o progresso em `checkpoint.json`, permitindo retomar extrações longas exatamente de onde pararam em caso de interrupção ou erro.
+- **Resiliência Avançada**: Implementa lógica de `retry` para lidar com quedas de sessão, timeouts e carregamentos lentos da interface.
+- **Configuração Multi-Ambiente**: Permite alternar facilmente entre diferentes URLs (ex: EAD, AVA) via arquivo JSON.
 
 ---
 
-## 3. Estrutura de Funções e Lógica
+## 🛠️ Pré-requisitos
 
-### 3.1 Inteligência de Lote e Auditoria
-- `processar_paginas_da_unidade()`: Gerencia o contador físico de arquivos e a meta dinâmica. É o núcleo que garante o "zero perda" de dados.
-- `contar_pdfs_na_pasta()`: Função auxiliar que interage com o Sistema Operacional para validar o sucesso real da operação de download.
-- `obter_info_paginacao()`: Usa Regex para interpretar dinamicamente a contagem de registros exibida no elemento `DataTables_Table_0_info`.
-
-### 3.2 Resiliência e Recuperação
-- `executar_com_retry()`: Em caso de falha de carregamento ou rede, o bot tenta reiniciar o estado da busca até 5 vezes antes de reportar erro crítico.
-- `ARQUIVO_CHECKPOINT`: Mantém o registro da última página e unidade concluída com sucesso, permitindo retomar o trabalho pesado sem duplicidade.
-
-### 3.3 Navegação RPA
-- `avancar_pagina()`: Utiliza múltiplos seletores para encontrar o botão "Próximo" e valida se a página mudou comparando o texto informativo anterior e atual.
-- `expandir_arvore()`: Algoritmo recursivo que garante que todos os níveis da estrutura organizacional fiquem visíveis para captura de IDs.
+1.  **Python 3.8+** instalado.
+2.  **Google Chrome** atualizado.
+3.  **Dependências Python**:
+    ```bash
+    pip install selenium webdriver-manager requests
+    ```
 
 ---
 
-## 4. Configurações e Variáveis Globais
+## ⚙️ Configuração (`configs.json`)
 
-| Variável | Valor Padrão | Descrição |
-| :--- | :--- | :--- |
-| `TIMEOUT_PADRAO` | 30s | Tempo de espera para elementos comuns. |
-| `TIMEOUT_DOWNLOAD` | 300s | Tempo máximo para geração/baixa de ZIPs grandes. |
-| `PAUSA_ENTRE_ACOES` | 2s | Delay de segurança para estabilidade da UI. |
-| `Lote de Registros` | 50 | Quantidade fixa por página para máxima compatibilidade. |
+O bot é controlado pelo arquivo `configs.json`. Certifique-se de preenchê-lo corretamente:
+
+```json
+{
+    "drive_letter": "D",  // Letra do drive onde os arquivos serão salvos
+    "ambientes": {
+        "ava": {
+            "ativo": true,
+            "url_login": "https://...",
+            "url_listagem": "https://...",
+            "credenciais": {
+                "login": "seu_email",
+                "senha": "sua_senha"
+            },
+            "unidades": ["566"] // IDs das unidades raiz. Deixe vazio [] para pegar todas.
+        }
+    }
+}
+```
 
 ---
 
-## 5. Manutenção e Erros Comuns
+## 📂 Estrutura do Projeto
 
-- **O Navegador fecha rápido demais?** O bot agora espera 60 segundos após erros fatais. Verifique o log no terminal para ver o erro técnico.
-- **Meta não bate?** O sistema de auditoria física reiniciará a página automaticamente se o download vier corrompido ou incompleto.
-- **IDs não encontrados?** Certifique-se de que a unidade no `configs.json` está expandida na árvore organizacional.
+- `main.py`: Script principal com toda a lógica de automação e auditoria.
+- `configs.json`: Arquivo de configuração de credenciais e ambientes.
+- `checkpoint.json`: Arquivo gerado automaticamente para controle de progresso.
+- `README.md`: Documentação técnica e guia de uso.
 
 ---
-**Documentação consolidada para garantir a rastreabilidade e integridade do processo de migração.**
+
+## 📋 Fluxo de Operação
+
+1.  **Login e Navegação**: O bot acessa o portal, realiza o login e navega até a página de listagem de certificados.
+2.  **Expansão de Árvore**: Expande recursivamente toda a estrutura de unidades para identificar os IDs alvos.
+3.  **Processamento por Página**:
+    - Configura a visualização para 50 registros.
+    - Seleciona os itens e inicia o processamento do ZIP.
+    - **Ação Crítica**: Monitora o sistema de arquivos até que o ZIP seja baixado.
+    - **Auditoria**: Abre o ZIP em memória, conta os arquivos e compara com a meta da página.
+4.  **Finalização**: Após processar todas as unidades, cria um arquivo consolidado `Resultado_Final_Bot.zip` na raiz do drive configurado.
+
+---
+
+## 🔧 Manutenção e Solução de Problemas
+
+- **Divergência de Contagem**: Se o bot detectar que o ZIP contém menos arquivos que o esperado, ele fechará o modal e tentará o download novamente.
+- **Logs**: O console exibe o status em tempo real: "Meta Final da Unidade", "Pagina X confirmada" ou "Tentativa X falhou".
+- **Erros Fatais**: Em caso de falha crítica, o navegador permanecerá aberto por 60 segundos com o erro impresso no terminal para facilitar a depuração.
+
+---
+**Desenvolvido para garantir máxima confiabilidade na migração de dados.**
