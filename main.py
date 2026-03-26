@@ -28,7 +28,7 @@ def carregar_config():
 
 CONFIG = carregar_config()
 DRIVE = CONFIG.get("drive_letter", "C").upper().strip().replace(":", "")
-PASTA_DOWNLOAD = f"{DRIVE}:\\"
+PASTA_DOWNLOAD = os.path.join(f"{DRIVE}:\\", "RPA_MIGRACAO_TEMP")
 
 # ==========================
 # CONFIGURACOES FIXAS
@@ -39,6 +39,9 @@ MAX_TENTATIVAS = 5
 PAUSA_ENTRE_ACOES = 2
 PAUSA_APOS_REFRESH = 3
 ARQUIVO_CHECKPOINT = "checkpoint.json"
+
+# Garante que a pasta temporária de downloads existe e está limpa
+os.makedirs(PASTA_DOWNLOAD, exist_ok=True)
 
 ambientes = CONFIG.get("ambientes", {})
 ambiente_escolhido = None
@@ -94,6 +97,7 @@ def aguardar_download(pasta, arquivos_antes, timeout=600):
     inicio = time.time()
     print(f"Aguardando arquivo ZIP aparecer em {pasta}...")
     
+    ultimo_log = time.time()
     while time.time() - inicio < timeout:
         arquivos_agora = set(glob.glob(os.path.join(pasta, "*.zip")))
         novos = arquivos_agora - arquivos_antes
@@ -105,7 +109,7 @@ def aguardar_download(pasta, arquivos_antes, timeout=600):
             
             try:
                 # Pequena espera para garantir que o SO liberou o arquivo apos o renomeio do Chrome
-                time.sleep(1)
+                time.sleep(2)
                 tamanho_ini = os.path.getsize(candidato)
                 if tamanho_ini > 0:
                     print(f"Download concluido com sucesso: {os.path.basename(candidato)}")
@@ -113,6 +117,15 @@ def aguardar_download(pasta, arquivos_antes, timeout=600):
             except Exception as e:
                 print(f"Aguardando estabilizacao do arquivo... ({e})")
         
+        # Log de progresso a cada 10 segundos para o usuario nao achar que travou
+        if time.time() - ultimo_log > 10:
+            crdownloads = glob.glob(os.path.join(pasta, "*.crdownload"))
+            if crdownloads:
+                print(f"... Download em progresso ({len(crdownloads)} arquivo(s) .crdownload detectado(s)) ...")
+            else:
+                print(f"... Ainda aguardando o inicio do download em {pasta} ...")
+            ultimo_log = time.time()
+
         time.sleep(1)
     
     raise TimeoutException("Tempo excedido aguardando o surgimento do arquivo ZIP no disco.")
@@ -305,18 +318,47 @@ def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade
             continue
 
         esperado_nesta_p = ate - de + 1
+        
+        # VALIDAÇÃO DE REGRA DE NEGÓCIO: Páginas intermediárias DEVEM ter 50 registros.
+        # Se o portal indicar menos de 50 e não for a última página, algo carregou errado.
+        if not is_last_page and esperado_nesta_p < 50:
+            print(f"AVISO: Página {pagina_atual} indica apenas {esperado_nesta_p} registros, mas não é a última.")
+            print("Isso indica falha de carregamento do portal. Forçando REFRESH TOTAL...")
+            driver.refresh()
+            time.sleep(PAUSA_APOS_REFRESH)
+            navegar_para_listagem(driver)
+            reabrir_busca_avancada_e_modal(driver)
+            selecionar_unidade_e_buscar(driver, id_unidade)
+            definir_quantidade_por_pagina(driver)
+            for _ in range(pagina_atual - 1): avancar_pagina(driver)
+            continue
+
         print(f"Processando Pagina {pagina_atual} (Meta: {esperado_nesta_p} registros).")
 
         sucesso_pagina = False
         for tentativa_pag in range(1, 4):
             total_antes = contar_pdfs_nos_zips(pasta_destino)
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
+            time.sleep(2)
             
             checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox' and @ng-model='check.value']")
+            
+            # Validação rigorosa do DOM: Se o número de checkboxes não bater com a meta da página, não prossegue
             if len(checkboxes) < esperado_nesta_p:
-                time.sleep(4)
+                print(f"Tentativa {tentativa_pag}: Encontrados {len(checkboxes)} checkboxes, mas o sistema indica {esperado_nesta_p}. Aguardando carregamento...")
+                time.sleep(5)
                 checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox' and @ng-model='check.value']")
+            
+            if len(checkboxes) < esperado_nesta_p:
+                if tentativa_pag < 3:
+                    print(f"Pagina {pagina_atual} ainda incompleta. Tentando scroll e nova leitura...")
+                    driver.execute_script("window.scrollTo(0, 0);")
+                    time.sleep(1)
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    continue
+                else:
+                    print(f"FALHA GRAVE: A pagina {pagina_atual} nao carregou todos os {esperado_nesta_p} registros apos 3 tentativas.")
+                    raise Exception(f"Divergência de registros no carregamento da pagina {pagina_atual}.")
 
             selecionados = 0
             for cb in checkboxes:
@@ -325,9 +367,26 @@ def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade
                     selecionados += 1
                 except: pass
             
+            # Garante que selecionamos EXATAMENTE o que a página diz ter
+            if selecionados < esperado_nesta_p:
+                print(f"Erro ao clicar: Selecionados {selecionados}/{esperado_nesta_p}. Tentando novamente...")
+                continue
+
             print(f"Selecionados {selecionados} registros para baixar.")
-            status = baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page)
+            status = baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, selecionados)
             
+            if status == "REFRESH_RETRY":
+                print(f"Reiniciando Pagina {pagina_atual} com REFRESH TOTAL...")
+                driver.refresh()
+                time.sleep(PAUSA_APOS_REFRESH)
+                navegar_para_listagem(driver)
+                reabrir_busca_avancada_e_modal(driver)
+                selecionar_unidade_e_buscar(driver, id_unidade)
+                definir_quantidade_por_pagina(driver)
+                # Avança até a página correta novamente
+                for _ in range(pagina_atual - 1): avancar_pagina(driver)
+                continue
+
             if status == "RETRY":
                 print(f"Reiniciando selecao na pagina {pagina_atual}...")
                 for cb in checkboxes:
@@ -396,7 +455,7 @@ def avancar_pagina(driver):
         except: return False
     return False
 
-def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page):
+def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, esperado_selecao):
     wait = WebDriverWait(driver, TIMEOUT_PADRAO)
     
     # 1. Clicar em 'Baixar Certificados' para abrir o modal
@@ -404,34 +463,40 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page):
     btn_gerar = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Baixar Certificados')]")))
     driver.execute_script("arguments[0].click();", btn_gerar)
     
-    # VERIFICACAO SOLICITADA: Total < 50 e nao e ultima pagina
+    # VERIFICACAO RIGOROSA: Total no modal deve bater com o esperado
     try:
-        # Reduzimos o tempo de espera para a verificação ser rápida (evita o "demorando")
-        wait_curto = WebDriverWait(driver, 5)
-        total_element = wait_curto.until(EC.visibility_of_element_located((By.XPATH, "//*[contains(text(), 'TOTAL PROCESSADO:')]")))
+        # Aguarda o "TOTAL PROCESSADO" aparecer e o spinner sumir
+        wait_curto = WebDriverWait(driver, 10)
+        # Seletor baseado no HTML fornecido pelo usuário
+        xpath_total = "//div[contains(@class, 'ng-binding') and contains(text(), 'TOTAL PROCESSADO:')]"
+        total_element = wait_curto.until(EC.visibility_of_element_located((By.XPATH, xpath_total)))
+        
+        # Aguarda o texto estabilizar (pode começar com "0 de 0" e subir)
+        time.sleep(2)
         texto_total = total_element.text
         match = re.search(r'de\s+(\d+)', texto_total)
+        
         if match:
-            total_modal = int(match.group(1))
-            print(f"Total detectado no modal: {total_modal}")
-            if total_modal < 50 and not is_last_page:
-                print(f"Aviso: Total {total_modal} < 50 e nao e a ultima pagina. Fechando e tentando novamente...")
+            total_no_modal = int(match.group(1))
+            print(f"Total detectado no modal: {total_no_modal} (Esperado: {esperado_selecao})")
+            
+            # Se o total no modal for menor que o esperado (e não for a última página que pode ter menos de 50)
+            if total_no_modal < esperado_selecao:
+                print(f"DIVERGÊNCIA DETECTADA! Modal diz {total_no_modal} mas esperávamos {esperado_selecao}.")
+                print("Fechando modal para forçar REFRESH da página...")
                 try:
-                    # Se abriu em nova aba (conforme o prompt sugere "fechar aba")
-                    if len(driver.window_handles) > 1:
-                        driver.close()
-                        driver.switch_to.window(driver.window_handles[0])
-                    else:
-                        # Se for modal (conforme 1.html), clicamos em cancelar
-                        btn_cancelar = driver.find_element(By.XPATH, "//button[contains(text(),'Cancelar')]")
-                        driver.execute_script("arguments[0].click();", btn_cancelar)
-                        WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".modal-backdrop, .modal")))
+                    btn_cancelar = driver.find_element(By.XPATH, "//button[contains(text(),'Cancelar')]")
+                    driver.execute_script("arguments[0].click();", btn_cancelar)
+                    WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".modal-backdrop, .modal")))
                 except: pass
-                return "RETRY"
+                return "REFRESH_RETRY"
+        else:
+            print("Não foi possível ler o total no modal. Prosseguindo com cautela...")
+            
     except Exception as e:
-        print(f"Modal detectado, mas info de total ainda nao visivel ou erro: {e}. Prosseguindo com clique no Iniciar...")
+        print(f"Aviso: Não conseguiu validar total no modal ({e}). Prosseguindo...")
 
-    # 2. Clicar em 'Iniciar' no modal (Acao solicitada: "ele deve clicar no botao iniciar")
+    # 2. Clicar em 'Iniciar' no modal
     print("Clicando no botao Iniciar...")
     btn_confirmar = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Iniciar')]")))
     driver.execute_script("arguments[0].click();", btn_confirmar)
@@ -440,6 +505,7 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page):
     print("Processando certificados... Aguardando conclusao.")
     btn_download = None
     inicio_proc = time.time()
+    ultimo_log_proc = time.time()
     while time.time() - inicio_proc < TIMEOUT_DOWNLOAD:
         try:
             # Tenta encontrar o botao pelo texto exato conforme o HTML fornecido
@@ -448,6 +514,11 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page):
                 btn_download = botoes[0]
                 break
         except: pass
+        
+        if time.time() - ultimo_log_proc > 30:
+            print(f"... Ainda processando no portal (aguardando ha {int(time.time() - inicio_proc)}s) ...")
+            ultimo_log_proc = time.time()
+            
         time.sleep(2)
     
     if not btn_download:
@@ -458,9 +529,30 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page):
     antes = set(glob.glob(os.path.join(PASTA_DOWNLOAD, "*.zip")))
     driver.execute_script("arguments[0].click();", btn_download)
     
-    # 5. Aguardar o arquivo no disco (agora ja configurado para baixar direto no drive)
+    # 5. Aguardar o arquivo no disco
     arquivo = aguardar_download(PASTA_DOWNLOAD, antes)
     
+    # --- AUDITORIA FÍSICA DO ZIP ---
+    print(f"Auditando integridade do arquivo {os.path.basename(arquivo)}...")
+    try:
+        with zipfile.ZipFile(arquivo, 'r') as z:
+            # Conta apenas arquivos que terminam com .pdf (ignora pastas ou arquivos de sistema)
+            lista_arquivos = [f for f in z.namelist() if f.lower().endswith('.pdf')]
+            total_no_zip = len(lista_arquivos)
+            
+        print(f"Auditoria: {total_no_zip} PDFs encontrados no ZIP.")
+        
+        if total_no_zip < esperado_selecao:
+            print(f"FALHA NA AUDITORIA! Esperados {esperado_selecao} PDFs, mas o ZIP contém apenas {total_no_zip}.")
+            print("Removendo arquivo defeituoso e solicitando nova tentativa...")
+            os.remove(arquivo)
+            return "RETRY" # Retorna para tentar selecionar/baixar novamente a mesma página
+        
+        print("Auditoria concluída com sucesso! 100% de integridade.")
+    except Exception as e:
+        print(f"Erro ao abrir o ZIP para auditoria: {e}")
+        return "RETRY"
+
     # 6. Mover/Renomear para a pasta da unidade
     os.makedirs(pasta_destino, exist_ok=True)
     nome_zip = f"pagina {pagina_atual}.zip"
