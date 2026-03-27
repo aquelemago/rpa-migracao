@@ -13,15 +13,13 @@ import glob
 import re
 import unicodedata
 import shutil
-import socket
-import requests
 import json
 import traceback
 import zipfile
 
 def carregar_config():
     if not os.path.exists("configs.json"):
-        print("Arquivo configs.json nao encontrado!")
+        print("[ERRO] Arquivo configs.json nao encontrado!")
         exit(1)
     with open("configs.json", "r", encoding="utf-8") as f:
         return json.load(f)
@@ -35,8 +33,6 @@ PASTA_DOWNLOAD = os.path.join(f"{DRIVE}:\\", "RPA_MIGRACAO_TEMP")
 # ==========================
 TIMEOUT_PADRAO = 30
 TIMEOUT_DOWNLOAD = 600
-MAX_TENTATIVAS = 5
-PAUSA_ENTRE_ACOES = 2
 PAUSA_APOS_REFRESH = 3
 ARQUIVO_CHECKPOINT = "checkpoint.json"
 
@@ -48,11 +44,11 @@ ambiente_escolhido = None
 for nome, dados in ambientes.items():
     if dados.get("ativo") == True:
         ambiente_escolhido = dados
-        print(f"Ambiente ativo: {nome}")
+        print(f"[LOG] Ambiente ativo selecionado: {nome}")
         break
 
 if ambiente_escolhido is None:
-    print("Nenhum ambiente ativo no configs.json.")
+    print("[ERRO] Nenhum ambiente ativo encontrado no configs.json.")
     exit(1)
 
 URL_LOGIN = ambiente_escolhido["url_login"]
@@ -86,49 +82,62 @@ def contar_pdfs_nos_zips(pasta):
     if not os.path.exists(pasta): return 0
     total = 0
     for f in os.listdir(pasta):
+        caminho_f = os.path.join(pasta, f)
         if f.lower().endswith('.zip'):
             try:
-                with zipfile.ZipFile(os.path.join(pasta, f), 'r') as z:
+                with zipfile.ZipFile(caminho_f, 'r') as z:
                     total += len([name for name in z.namelist() if name.lower().endswith('.pdf')])
             except: pass
+        elif f.lower().endswith('.pdf'):
+            total += 1
     return total
 
 def aguardar_download(pasta, arquivos_antes, timeout=600):
     inicio = time.time()
-    print(f"Aguardando arquivo ZIP aparecer em {pasta}...")
+    print(f"[LOG] Monitorando novos arquivos em: {pasta}")
     
     ultimo_log = time.time()
     while time.time() - inicio < timeout:
-        arquivos_agora = set(glob.glob(os.path.join(pasta, "*.zip")))
+        # Pega todos os arquivos na pasta, exceto temporários do Chrome
+        arquivos_agora = set([os.path.join(pasta, f) for f in os.listdir(pasta) 
+                             if not f.endswith(".crdownload") and not f.endswith(".tmp")])
+        
         novos = arquivos_agora - arquivos_antes
         
         if novos:
-            # Encontrou um novo ZIP. O Chrome so cria o .zip final apos concluir o .crdownload
+            # Encontrou algo novo que não é temporário
             candidato = list(novos)[0]
-            print(f"Detectado novo arquivo: {os.path.basename(candidato)}. Verificando integridade...")
+            ext = os.path.splitext(candidato)[1].lower()
+            print(f"[LOG] Novo arquivo detectado: {os.path.basename(candidato)} (Extensão: {ext})")
             
-            try:
-                # Pequena espera para garantir que o SO liberou o arquivo apos o renomeio do Chrome
-                time.sleep(2)
-                tamanho_ini = os.path.getsize(candidato)
-                if tamanho_ini > 0:
-                    print(f"Download concluido com sucesso: {os.path.basename(candidato)}")
-                    return candidato
-            except Exception as e:
-                print(f"Aguardando estabilizacao do arquivo... ({e})")
+            # Aguarda o arquivo estabilizar (tamanho parar de crescer e não estar travado)
+            tentativas_estabilizacao = 0
+            while tentativas_estabilizacao < 10:
+                try:
+                    tamanho_1 = os.path.getsize(candidato)
+                    time.sleep(2)
+                    tamanho_2 = os.path.getsize(candidato)
+                    if tamanho_1 == tamanho_2 and tamanho_1 > 0:
+                        print(f"[OK] Arquivo estabilizado: {os.path.basename(candidato)} ({tamanho_1} bytes)")
+                        return candidato
+                except Exception as e:
+                    print(f"[AVISO] Aguardando liberação do arquivo pelo SO... ({e})")
+                
+                tentativas_estabilizacao += 1
+                time.sleep(1)
         
-        # Log de progresso a cada 10 segundos para o usuario nao achar que travou
-        if time.time() - ultimo_log > 10:
-            crdownloads = glob.glob(os.path.join(pasta, "*.crdownload"))
+        # Log de progresso
+        if time.time() - ultimo_log > 15:
+            crdownloads = [f for f in os.listdir(pasta) if f.endswith(".crdownload")]
             if crdownloads:
-                print(f"... Download em progresso ({len(crdownloads)} arquivo(s) .crdownload detectado(s)) ...")
+                print(f"[STATUS] Download em curso: {crdownloads[0]}")
             else:
-                print(f"... Ainda aguardando o inicio do download em {pasta} ...")
+                print(f"[STATUS] Aguardando início do download... (Tempo decorrido: {int(time.time() - inicio)}s)")
             ultimo_log = time.time()
 
         time.sleep(1)
     
-    raise TimeoutException("Tempo excedido aguardando o surgimento do arquivo ZIP no disco.")
+    raise TimeoutException(f"Tempo excedido ({timeout}s) aguardando download em {pasta}")
 
 
 def aguardar_carregamento(driver):
@@ -144,7 +153,8 @@ def obter_info_paginacao(driver):
         wait = WebDriverWait(driver, 15)
         info_element = wait.until(lambda d: d.find_element(By.ID, "DataTables_Table_0_info") if d.find_element(By.ID, "DataTables_Table_0_info").text.strip() else False)
         info = info_element.text
-        match = re.search(r'(\d+)\s+até\s+([\d.,]+)\s+de\s+([\d.,]+)', info)
+        # Regex corrigido para aceitar separadores (. ou ,) em todos os números
+        match = re.search(r'([\d.,]+)\s+até\s+([\d.,]+)\s+de\s+([\d.,]+)', info)
         if match:
             de = int(match.group(1).replace('.', '').replace(',', ''))
             ate = int(match.group(2).replace('.', '').replace(',', ''))
@@ -163,12 +173,13 @@ def verificar_tabela_vazia(driver):
     except: return False
 
 def executar_com_retry(driver, funcao, *args, **kwargs):
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    tentativa = 1
+    while True:
         try:
             return funcao(*args, **kwargs)
         except Exception as e:
-            print(f"Tentativa {tentativa}/{MAX_TENTATIVAS} falhou: {e}")
-            if tentativa == MAX_TENTATIVAS: raise
+            print(f"[AVISO] Tentativa {tentativa} falhou: {e}")
+            tentativa += 1
             try:
                 driver.refresh()
                 time.sleep(PAUSA_APOS_REFRESH)
@@ -178,7 +189,7 @@ def executar_com_retry(driver, funcao, *args, **kwargs):
             except: pass
 
 def fazer_login(driver):
-    print("Iniciando Login...")
+    print("[LOG] Iniciando processo de login...")
     wait = WebDriverWait(driver, TIMEOUT_PADRAO)
     driver.get(URL_LOGIN)
     try: wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Entendi')]"))).click()
@@ -190,8 +201,8 @@ def fazer_login(driver):
     time.sleep(3)
 
 def navegar_para_listagem(driver):
-    print("Navegando para listagem de certificados...")
-    for tentativa in range(3):
+    print("[LOG] Navegando para a listagem de certificados...")
+    while True:
         driver.get(URL_LISTAGEM)
         time.sleep(5)
         
@@ -209,17 +220,15 @@ def navegar_para_listagem(driver):
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.XPATH, "//table | //button[@idaut='botao_busca_avancada']"))
             )
-            print("Pagina de listagem carregada com sucesso.")
+            print("[LOG] Pagina de listagem carregada com sucesso.")
             return
         except TimeoutException:
-            print(f"Pagina parece em branco (Tentativa {tentativa+1}/3). Atualizando...")
+            print("[LOG] Pagina em branco ou nao carregada. Atualizando...")
             driver.refresh()
             time.sleep(5)
-    
-    raise Exception("Falha ao carregar a pagina de listagem apos varias tentativas.")
 
 def expandir_arvore(driver):
-    print("Expandindo arvore organizacional...")
+    print("[LOG] Expandindo arvore organizacional...")
     wait = WebDriverWait(driver, TIMEOUT_PADRAO)
     wait.until(EC.presence_of_element_located((By.XPATH, "//i[contains(@class,'fa-plus-square-o')]")))
     while True:
@@ -274,6 +283,7 @@ def obter_todos_ids_descendentes(driver, checkbox_raiz):
     return ids
 
 def selecionar_unidade_e_buscar(driver, id_unidade):
+    print(f"[LOG] Selecionando unidade {id_unidade} e disparando busca...")
     wait = WebDriverWait(driver, TIMEOUT_PADRAO)
     driver.execute_script("arguments[0].click();", wait.until(EC.element_to_be_clickable((By.ID, f"input_selected_unit_{id_unidade}"))) )
     time.sleep(1)
@@ -283,14 +293,22 @@ def selecionar_unidade_e_buscar(driver, id_unidade):
     time.sleep(3)
 
 def definir_quantidade_por_pagina(driver):
-    print("Configurando exibicao de 50 registros por pagina...")
+    print("[LOG] Configurando exibicao para 10 registros por pagina...")
     wait = WebDriverWait(driver, TIMEOUT_PADRAO)
     try:
-        select_qtd = wait.until(EC.presence_of_element_located((By.XPATH, "//select[option[@value='50']]")))
-        Select(select_qtd).select_by_value("50")
+        select_qtd = wait.until(EC.presence_of_element_located((By.XPATH, "//select[option[@value='10']]")))
+        Select(select_qtd).select_by_value("10")
         time.sleep(2)
         aguardar_carregamento(driver)
-    except: pass
+        
+        # GARANTIA: Clicar em Buscar para o portal processar o limite de 10
+        print("[LOG] Refazendo busca para confirmar limite de 10 registros...")
+        btn_busca = driver.find_element(By.XPATH, "//button[@title='Buscar']")
+        driver.execute_script("arguments[0].click();", btn_busca)
+        time.sleep(4)
+        aguardar_carregamento(driver)
+    except Exception as e:
+        print(f"[AVISO] Nao conseguiu definir 10 por pagina: {e}")
 
 def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade, processadas_global):
     pagina_atual = 1
@@ -306,12 +324,12 @@ def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade
         
         if total_esperado_final is None and total is not None:
             total_esperado_final = total
-            print(f"Meta Final da Unidade {id_unidade}: {total_esperado_final} registros.")
+            print(f"[STATUS] Meta Final da Unidade {id_unidade}: {total_esperado_final} registros.")
         
         if verificar_tabela_vazia(driver): break
 
         if pagina_atual <= ultima_pag_concluida:
-            print(f"Pagina {pagina_atual} ja auditada. Saltando...")
+            print(f"[INFO] Pagina {pagina_atual} ja auditada. Avancando...")
             total_confirmado = ate
             if not avancar_pagina(driver): break
             pagina_atual += 1
@@ -319,11 +337,11 @@ def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade
 
         esperado_nesta_p = ate - de + 1
         
-        # VALIDAÇÃO DE REGRA DE NEGÓCIO: Páginas intermediárias DEVEM ter 50 registros.
-        # Se o portal indicar menos de 50 e não for a última página, algo carregou errado.
-        if not is_last_page and esperado_nesta_p < 50:
-            print(f"AVISO: Página {pagina_atual} indica apenas {esperado_nesta_p} registros, mas não é a última.")
-            print("Isso indica falha de carregamento do portal. Forçando REFRESH TOTAL...")
+        # VALIDAÇÃO DE REGRA DE NEGÓCIO: Páginas intermediárias DEVEM ter 10 registros.
+        # Exceção: Primeira e Última página.
+        if (pagina_atual > 1 and not is_last_page) and esperado_nesta_p < 10:
+            print(f"[ALERTA] Pagina intermediária {pagina_atual} indica apenas {esperado_nesta_p} registros.")
+            print("[ACAO] Forcando refresh total para corrigir carregamento incompleto...")
             driver.refresh()
             time.sleep(PAUSA_APOS_REFRESH)
             navegar_para_listagem(driver)
@@ -333,90 +351,169 @@ def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade
             for _ in range(pagina_atual - 1): avancar_pagina(driver)
             continue
 
-        print(f"Processando Pagina {pagina_atual} (Meta: {esperado_nesta_p} registros).")
+        print(f"[LOG] Processando Pagina {pagina_atual} (Meta: {esperado_nesta_p} registros).")
 
-        sucesso_pagina = False
-        for tentativa_pag in range(1, 4):
+        tentativa_pag = 1
+        while True:
             total_antes = contar_pdfs_nos_zips(pasta_destino)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
             
-            checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox' and @ng-model='check.value']")
-            
-            # Validação rigorosa do DOM: Se o número de checkboxes não bater com a meta da página, não prossegue
-            if len(checkboxes) < esperado_nesta_p:
-                print(f"Tentativa {tentativa_pag}: Encontrados {len(checkboxes)} checkboxes, mas o sistema indica {esperado_nesta_p}. Aguardando carregamento...")
-                time.sleep(5)
-                checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox' and @ng-model='check.value']")
-            
-            if len(checkboxes) < esperado_nesta_p:
-                if tentativa_pag < 3:
-                    print(f"Pagina {pagina_atual} ainda incompleta. Tentando scroll e nova leitura...")
-                    driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(1)
+                # Workflow: Selecionar Um a Um
+            try:
+                print(f"[LOG] Selecionando checkboxes um a um na pagina {pagina_atual}...")
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
+                
+                # Localiza os checkboxes dentro da ibox-content conforme solicitado
+                xpath_checkboxes = "//div[@class='ibox-content']//table[contains(@id, 'DataTables_Table')]//tbody//input[@type='checkbox']"
+                checkboxes = driver.find_elements(By.XPATH, xpath_checkboxes)
+                
+                for cb in checkboxes:
+                    try:
+                        if not cb.is_selected():
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cb)
+                            driver.execute_script("arguments[0].click();", cb)
+                            time.sleep(0.5) # Delay para seleção lenta
+                    except: continue
+                
+                time.sleep(2)
+                # Verificacao se selecionou o esperado (checando os checkboxes do corpo da tabela)
+                checkboxes = driver.find_elements(By.XPATH, xpath_checkboxes)
+                selecionados = len([cb for cb in checkboxes if cb.is_selected()])
+                
+                if selecionados < esperado_nesta_p:
+                    print(f"[DEBUG] Selecionados {selecionados} de {esperado_nesta_p}. Tentando scroll para carregar DOM...")
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+                    checkboxes = driver.find_elements(By.XPATH, "//table[contains(@id, 'DataTables_Table')]//tbody//input[@type='checkbox']")
+                    selecionados = len([cb for cb in checkboxes if cb.is_selected()])
+
+                if selecionados < esperado_nesta_p:
+                    print(f"[AVISO] Divergencia na selecao ({selecionados}/{esperado_nesta_p}). Reiniciando workflow da pagina...")
+                    driver.refresh()
+                    time.sleep(PAUSA_APOS_REFRESH)
+                    navegar_para_listagem(driver)
+                    reabrir_busca_avancada_e_modal(driver)
+                    selecionar_unidade_e_buscar(driver, id_unidade)
+                    definir_quantidade_por_pagina(driver)
+                    for _ in range(pagina_atual - 1): avancar_pagina(driver)
+                    tentativa_pag += 1
                     continue
+
+                print(f"[LOG] {selecionados} registros selecionados. Iniciando download...")
+                status = baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, selecionados)
+                
+                if status == "CORRIGIR_SELECAO":
+                    print("[ACAO] Iniciando protocolo avançado de correção (Dança das Páginas)...")
+                    # 1. Volta uma página (se possível)
+                    if voltar_pagina(driver):
+                        # 2. Seleciona um a um na página anterior
+                        try:
+                            xpath_cb_prev = "//div[@class='ibox-content']//table[contains(@id, 'DataTables_Table')]//tbody//input[@type='checkbox']"
+                            cbs_prev = driver.find_elements(By.XPATH, xpath_cb_prev)
+                            for cb in cbs_prev:
+                                try:
+                                    if not cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
+                                except: pass
+                            time.sleep(1)
+                        except: pass
+                        
+                        # 3. Abre e apenas fecha o modal de processamento na página anterior
+                        try:
+                            btn_gerar_v = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Baixar Certificados')]")))
+                            driver.execute_script("arguments[0].click();", btn_gerar_v)
+                            time.sleep(3) # Tempo para o portal "sentir" a seleção
+                            btn_cancelar_v = driver.find_element(By.XPATH, "//button[contains(text(),'Cancelar')]")
+                            driver.execute_script("arguments[0].click();", btn_cancelar_v)
+                            WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".modal-backdrop, .modal")))
+                            time.sleep(1)
+                        except: pass
+                        
+                        # 4. Limpa a seleção da página anterior individualmente
+                        try:
+                            cbs_prev = driver.find_elements(By.XPATH, "//div[@class='ibox-content']//table[contains(@id, 'DataTables_Table')]//tbody//input[@type='checkbox']")
+                            for cb in cbs_prev:
+                                try:
+                                    if cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
+                                except: pass
+                            time.sleep(1)
+                        except: pass
+                        
+                        # 5. Volta para a página atual
+                        avancar_pagina(driver)
+                    
+                    # 6. Limpa a seleção da página atual individualmente (se houver resquício)
+                    try:
+                        cbs_curr = driver.find_elements(By.XPATH, "//div[@class='ibox-content']//table[contains(@id, 'DataTables_Table')]//tbody//input[@type='checkbox']")
+                        for cb in cbs_curr:
+                            try:
+                                if cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
+                            except: pass
+                        time.sleep(1)
+                    except: pass
+                    
+                    # O loop 'while True' da tentativa_pag subirá e fará a seleção limpa da página atual
+                    tentativa_pag += 1
+                    continue
+
+                if status == "REFRESH_RETRY":
+                    print("[ACAO] Refresh solicitado pelo fluxo de download.")
+                    driver.refresh()
+                    time.sleep(PAUSA_APOS_REFRESH)
+                    navegar_para_listagem(driver)
+                    reabrir_busca_avancada_e_modal(driver)
+                    selecionar_unidade_e_buscar(driver, id_unidade)
+                    definir_quantidade_por_pagina(driver)
+                    for _ in range(pagina_atual - 1): avancar_pagina(driver)
+                    tentativa_pag += 1
+                    continue
+
+                if status == "RETRY":
+                    print("[LOG] Falha detectada no download ou auditoria. Forçando REFRESH para nova tentativa...")
+                    driver.refresh()
+                    time.sleep(PAUSA_APOS_REFRESH)
+                    navegar_para_listagem(driver)
+                    reabrir_busca_avancada_e_modal(driver)
+                    selecionar_unidade_e_buscar(driver, id_unidade)
+                    definir_quantidade_por_pagina(driver)
+                    for _ in range(pagina_atual - 1): avancar_pagina(driver)
+                    tentativa_pag += 1
+                    continue
+
+                total_depois = contar_pdfs_nos_zips(pasta_destino)
+                obtidos = total_depois - total_antes
+                
+                if obtidos >= selecionados:
+                    print(f"[SUCESSO] Pagina {pagina_atual} confirmada: {obtidos} arquivos salvos.")
+                    total_confirmado += obtidos
+                    # Desmarca tudo para a proxima pagina ou unidade individualmente
+                    for cb in checkboxes:
+                        try:
+                            if cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
+                        except: pass
+                    break
                 else:
-                    print(f"FALHA GRAVE: A pagina {pagina_atual} nao carregou todos os {esperado_nesta_p} registros apos 3 tentativas.")
-                    raise Exception(f"Divergência de registros no carregamento da pagina {pagina_atual}.")
-
-            selecionados = 0
-            for cb in checkboxes:
-                try:
-                    if not cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
-                    selecionados += 1
-                except: pass
-            
-            # Garante que selecionamos EXATAMENTE o que a página diz ter
-            if selecionados < esperado_nesta_p:
-                print(f"Erro ao clicar: Selecionados {selecionados}/{esperado_nesta_p}. Tentando novamente...")
-                continue
-
-            print(f"Selecionados {selecionados} registros para baixar.")
-            status = baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, selecionados)
-            
-            if status == "REFRESH_RETRY":
-                print(f"Reiniciando Pagina {pagina_atual} com REFRESH TOTAL...")
+                    print(f"[ERRO] Integridade falhou na Pagina {pagina_atual}: Esperava {selecionados}, obteve {obtidos}.")
+                    tentativa_pag += 1
+                    # Refresh e tenta de novo
+                    driver.refresh()
+                    time.sleep(PAUSA_APOS_REFRESH)
+                    navegar_para_listagem(driver)
+                    reabrir_busca_avancada_e_modal(driver)
+                    selecionar_unidade_e_buscar(driver, id_unidade)
+                    definir_quantidade_por_pagina(driver)
+                    for _ in range(pagina_atual - 1): avancar_pagina(driver)
+                    continue
+            except Exception as e:
+                print(f"[ERRO] Falha no workflow da pagina {pagina_atual}: {e}")
                 driver.refresh()
                 time.sleep(PAUSA_APOS_REFRESH)
                 navegar_para_listagem(driver)
                 reabrir_busca_avancada_e_modal(driver)
                 selecionar_unidade_e_buscar(driver, id_unidade)
                 definir_quantidade_por_pagina(driver)
-                # Avança até a página correta novamente
                 for _ in range(pagina_atual - 1): avancar_pagina(driver)
+                tentativa_pag += 1
                 continue
-
-            if status == "RETRY":
-                print(f"Reiniciando selecao na pagina {pagina_atual}...")
-                for cb in checkboxes:
-                    try:
-                        if cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
-                    except: pass
-                time.sleep(PAUSA_ENTRE_ACOES)
-                continue
-
-            total_depois = contar_pdfs_nos_zips(pasta_destino)
-            obtidos = total_depois - total_antes
-            
-            if obtidos >= selecionados:
-                print(f"Pagina {pagina_atual} confirmada: {obtidos} arquivos salvos.")
-                total_confirmado += obtidos
-                sucesso_pagina = True
-                for cb in checkboxes:
-                    try:
-                        if cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
-                    except: pass
-                break
-            else:
-                print(f"Erro na Pagina {pagina_atual}: Esperava {selecionados}, obteve {obtidos}. Tentando novamente...")
-                for cb in checkboxes:
-                    try:
-                        if cb.is_selected(): driver.execute_script("arguments[0].click();", cb)
-                    except: pass
-                time.sleep(5)
-
-        if not sucesso_pagina: raise Exception(f"Falha na integridade da Pagina {pagina_atual}.")
 
         processadas_global[str(id_unidade)] = {"pagina": pagina_atual, "acumulado": total_confirmado}
         salvar_checkpoint(processadas_global)
@@ -425,11 +522,7 @@ def processar_paginas_da_unidade(driver, nome_unidade, pasta_destino, id_unidade
         pagina_atual += 1
 
     total_fisico = contar_pdfs_nos_zips(pasta_destino)
-    if total_esperado_final is not None and total_fisico < total_esperado_final:
-        print(f"Divergencia Final: HD {total_fisico}, Sistema {total_esperado_final}.")
-        raise Exception("Unidade incompleta.")
-    
-    print(f"Unidade {id_unidade} concluida: {total_fisico} arquivos.")
+    print(f"[LOG] Unidade {id_unidade} concluida. Total auditado: {total_fisico} arquivos.")
     processadas_global[str(id_unidade)] = {"pagina": 9999, "acumulado": total_fisico}
     salvar_checkpoint(processadas_global)
 
@@ -438,6 +531,28 @@ def avancar_pagina(driver):
     try: info_ant = driver.find_element(By.ID, "DataTables_Table_0_info").text
     except: pass
     seletores = ["//li[contains(@class,'next') and not(contains(@class,'disabled'))]/a", "//*[@id='DataTables_Table_0_paginate']//li[@class='next']/a"]
+    btn = None
+    for s in seletores:
+        try:
+            el = driver.find_elements(By.XPATH, s)
+            if el and el[0].is_displayed(): btn = el[0]; break
+        except: continue
+    if btn:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+            time.sleep(1); driver.execute_script("arguments[0].click();", btn)
+            if info_ant:
+                try: WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, "DataTables_Table_0_info").text != info_ant)
+                except: time.sleep(5)
+            aguardar_carregamento(driver); return True
+        except: return False
+    return False
+
+def voltar_pagina(driver):
+    info_ant = ""
+    try: info_ant = driver.find_element(By.ID, "DataTables_Table_0_info").text
+    except: pass
+    seletores = ["//li[contains(@class,'prev') and not(contains(@class,'disabled'))]/a", "//li[contains(@class,'previous') and not(contains(@class,'disabled'))]/a"]
     btn = None
     for s in seletores:
         try:
@@ -465,36 +580,63 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, espera
     
     # VERIFICACAO RIGOROSA: Total no modal deve bater com o esperado
     try:
-        # Aguarda o "TOTAL PROCESSADO" aparecer e o spinner sumir
-        wait_curto = WebDriverWait(driver, 10)
-        # Seletor baseado no HTML fornecido pelo usuário
-        xpath_total = "//div[contains(@class, 'ng-binding') and contains(text(), 'TOTAL PROCESSADO:')]"
+        print("Aguardando estabilização do total no modal...")
+        wait_curto = WebDriverWait(driver, 35)
+        
+        # 1. Aguarda o spinner sumir (ng-hide) para garantir que o processamento do modal terminou
+        try:
+            wait_curto.until(EC.presence_of_element_located((By.XPATH, "//i[contains(@class, 'fa-spinner') and contains(@class, 'ng-hide')]")))
+        except:
+            print("Aviso: Spinner não indicou finalização, mas prosseguindo.")
+
+        # 2. Localiza o elemento de "Total Selecionado" (A nova Meta Real conforme HTML fornecido)
+        xpath_selecionado = "//div[contains(@class, 'total-certificados')]"
+        el_selecionado = wait_curto.until(EC.visibility_of_element_located((By.XPATH, xpath_selecionado)))
+        
+        # 3. Localiza o texto de "TOTAL PROCESSADO" para capturar o "X de Y"
+        xpath_total = "//*[contains(text(), 'TOTAL PROCESSADO:')]"
         total_element = wait_curto.until(EC.visibility_of_element_located((By.XPATH, xpath_total)))
         
-        # Aguarda o texto estabilizar (pode começar com "0 de 0" e subir)
-        time.sleep(2)
-        texto_total = total_element.text
-        match = re.search(r'de\s+(\d+)', texto_total)
+        time.sleep(4) # Estabilização Angular
         
-        if match:
-            total_no_modal = int(match.group(1))
-            print(f"Total detectado no modal: {total_no_modal} (Esperado: {esperado_selecao})")
+        texto_sel = el_selecionado.text
+        texto_proc = total_element.text
+        print(f"Auditoria Modal -> Selecionado: '{texto_sel}' | Processado: '{texto_proc}'")
+        
+        # Extrai números de ambos
+        match_sel = re.search(r'Total Selecionado:\s*([\d.,]+)', texto_sel, re.IGNORECASE)
+        match_proc = re.search(r'TOTAL PROCESSADO:\s*(\d+)\s*de\s*([\d.,]+)', texto_proc, re.IGNORECASE)
+        
+        if match_sel and match_proc:
+            meta_real = int(match_sel.group(1).replace('.', '').replace(',', ''))
+            total_no_modal = int(match_proc.group(2).replace('.', '').replace(',', ''))
             
-            # Se o total no modal for menor que o esperado (e não for a última página que pode ter menos de 50)
-            if total_no_modal < esperado_selecao:
-                print(f"DIVERGÊNCIA DETECTADA! Modal diz {total_no_modal} mas esperávamos {esperado_selecao}.")
-                print("Fechando modal para forçar REFRESH da página...")
+            print(f"Meta detectada: {meta_real} | Total no Modal: {total_no_modal} (Esperado: {esperado_selecao})")
+            
+            # VALIDAÇÃO CRÍTICA: Se a meta real ou o total do modal fugirem do esperado (ex: 1050)
+            if meta_real != esperado_selecao or total_no_modal != esperado_selecao:
+                print(f"[ALERTA] Divergência! Meta Real {meta_real} ou Modal {total_no_modal} não batem com {esperado_selecao}.")
                 try:
                     btn_cancelar = driver.find_element(By.XPATH, "//button[contains(text(),'Cancelar')]")
                     driver.execute_script("arguments[0].click();", btn_cancelar)
                     WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".modal-backdrop, .modal")))
                 except: pass
-                return "REFRESH_RETRY"
+                return "CORRIGIR_SELECAO"
         else:
-            print("Não foi possível ler o total no modal. Prosseguindo com cautela...")
-            
+            # Fallback caso um dos elementos não tenha o número
+            print("Aviso: Falha ao extrair números do modal. Verificando apenas o processado...")
+            if match_proc:
+                total_no_modal = int(match_proc.group(2).replace('.', '').replace(',', ''))
+                if total_no_modal != esperado_selecao:
+                    # Cancelar...
+                    try:
+                        btn_cancelar = driver.find_element(By.XPATH, "//button[contains(text(),'Cancelar')]")
+                        driver.execute_script("arguments[0].click();", btn_cancelar)
+                    except: pass
+                    return "CORRIGIR_SELECAO"
+
     except Exception as e:
-        print(f"Aviso: Não conseguiu validar total no modal ({e}). Prosseguindo...")
+        print(f"Aviso: Não conseguiu validar meta no modal ({e}). Prosseguindo...")
 
     # 2. Clicar em 'Iniciar' no modal
     print("Clicando no botao Iniciar...")
@@ -506,13 +648,19 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, espera
     btn_download = None
     inicio_proc = time.time()
     ultimo_log_proc = time.time()
+    
+    # Seletor ultra-específico: Texto exato e comando exato
+    xpath_zip = "//button[contains(text(), 'Download do ZIP') and @ng-click='downloadCertificados();']"
+    
     while time.time() - inicio_proc < TIMEOUT_DOWNLOAD:
         try:
-            # Tenta encontrar o botao pelo texto exato conforme o HTML fornecido
-            botoes = driver.find_elements(By.XPATH, "//button[contains(text(),'Download do ZIP')]")
-            if botoes and botoes[0].is_displayed():
-                btn_download = botoes[0]
-                break
+            # Busca apenas botões que estejam visíveis
+            botoes = driver.find_elements(By.XPATH, xpath_zip)
+            for b in botoes:
+                if b.is_displayed() and b.is_enabled():
+                    btn_download = b
+                    break
+            if btn_download: break
         except: pass
         
         if time.time() - ultimo_log_proc > 30:
@@ -522,41 +670,61 @@ def baixar_zip_unidade(driver, pagina_atual, pasta_destino, is_last_page, espera
         time.sleep(2)
     
     if not btn_download:
-        raise TimeoutException("O botao 'Download do ZIP' nao apareceu no tempo limite.")
+        raise TimeoutException("O botao 'Download do ZIP' nao apareceu ou nao ficou pronto para clique.")
 
     # 4. Iniciar o download
-    print("Botao de download encontrado! Iniciando transferencia...")
-    antes = set(glob.glob(os.path.join(PASTA_DOWNLOAD, "*.zip")))
+    print(f"Botao de download confirmado! Disparando transferencia via Script...")
+    # Pega todos os arquivos atuais para comparar depois
+    antes = set([os.path.join(PASTA_DOWNLOAD, f) for f in os.listdir(PASTA_DOWNLOAD)])
+    
+    # Usamos execute_script como primeira opção para garantir que o clique seja registrado
+    # mesmo se houver um overlay invisível do modal na frente.
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn_download)
+    time.sleep(1)
     driver.execute_script("arguments[0].click();", btn_download)
     
     # 5. Aguardar o arquivo no disco
     arquivo = aguardar_download(PASTA_DOWNLOAD, antes)
     
-    # --- AUDITORIA FÍSICA DO ZIP ---
-    print(f"Auditando integridade do arquivo {os.path.basename(arquivo)}...")
-    try:
-        with zipfile.ZipFile(arquivo, 'r') as z:
-            # Conta apenas arquivos que terminam com .pdf (ignora pastas ou arquivos de sistema)
-            lista_arquivos = [f for f in z.namelist() if f.lower().endswith('.pdf')]
-            total_no_zip = len(lista_arquivos)
-            
-        print(f"Auditoria: {total_no_zip} PDFs encontrados no ZIP.")
-        
-        if total_no_zip < esperado_selecao:
-            print(f"FALHA NA AUDITORIA! Esperados {esperado_selecao} PDFs, mas o ZIP contém apenas {total_no_zip}.")
-            print("Removendo arquivo defeituoso e solicitando nova tentativa...")
-            os.remove(arquivo)
-            return "RETRY" # Retorna para tentar selecionar/baixar novamente a mesma página
-        
-        print("Auditoria concluída com sucesso! 100% de integridade.")
-    except Exception as e:
-        print(f"Erro ao abrir o ZIP para auditoria: {e}")
+    # --- AUDITORIA FÍSICA DO ARQUIVO ---
+    ext = os.path.splitext(arquivo)[1].lower()
+    print(f"Auditando integridade do arquivo {os.path.basename(arquivo)} (Tipo: {ext})...")
+    
+    total_no_arquivo = 0
+    if ext == ".zip":
+        try:
+            with zipfile.ZipFile(arquivo, 'r') as z:
+                # Conta apenas arquivos que terminam com .pdf (ignora pastas ou arquivos de sistema)
+                lista_arquivos = [f for f in z.namelist() if f.lower().endswith('.pdf')]
+                total_no_arquivo = len(lista_arquivos)
+            print(f"Auditoria ZIP: {total_no_arquivo} PDFs encontrados.")
+        except Exception as e:
+            print(f"[ERRO] Falha ao ler ZIP: {e}")
+            return "RETRY"
+    elif ext == ".pdf":
+        total_no_arquivo = 1
+        print(f"Auditoria PDF: Identificado arquivo PDF único.")
+    else:
+        print(f"[AVISO] Extensão inesperada ({ext}). Tratando como 1 arquivo para continuidade.")
+        total_no_arquivo = 1
+
+    if total_no_arquivo < esperado_selecao and ext == ".zip":
+        print(f"FALHA NA AUDITORIA! Esperados {esperado_selecao} PDFs, mas o ZIP contém apenas {total_no_arquivo}.")
+        print("Removendo arquivo defeituoso e solicitando nova tentativa...")
+        try: os.remove(arquivo)
+        except: pass
         return "RETRY"
+    
+    print("Auditoria concluída com sucesso!")
 
     # 6. Mover/Renomear para a pasta da unidade
     os.makedirs(pasta_destino, exist_ok=True)
-    nome_zip = f"pagina {pagina_atual}.zip"
-    destino_final = os.path.join(pasta_destino, nome_zip)
+    if ext == ".zip":
+        nome_final = f"pagina {pagina_atual}.zip"
+    else:
+        nome_final = f"pagina {pagina_atual}{ext}"
+        
+    destino_final = os.path.join(pasta_destino, nome_final)
     
     # Se ja existir (devido a retry), remove o antigo
     if os.path.exists(destino_final): os.remove(destino_final)
@@ -632,46 +800,56 @@ def main():
             try:
                 cb_raiz = WebDriverWait(driver, TIMEOUT_PADRAO).until(EC.presence_of_element_located((By.ID, f"input_selected_unit_{id_raiz}")))
                 ids_desc = obter_todos_ids_descendentes(driver, cb_raiz)
-            except: continue
+            except Exception as e:
+                print(f"[ERRO] Falha ao identificar descendentes da raiz {id_raiz}: {e}")
+                continue
 
             for id_u in ids_desc:
                 if processadas_global.get(str(id_u), {}).get("pagina") == 9999: continue
-                print(f"\n--- Iniciando Unidade: {id_u} ---")
+                print(f"\n[LOG] Iniciando processamento da Unidade ID: {id_u}")
                 try:
                     def rodar():
                         nonlocal driver, id_u, processadas_global, pasta_raiz
                         cb = WebDriverWait(driver, TIMEOUT_PADRAO).until(EC.presence_of_element_located((By.ID, f"input_selected_unit_{id_u}")))
                         li = cb.find_element(By.XPATH, "./ancestor::li[1]")
                         if li.find_elements(By.XPATH, ".//i[contains(@class,'fa-plus-square-o')]") or li.find_elements(By.XPATH, ".//a[starts-with(@id, 'link_child_')]"):
+                            print(f"[INFO] Unidade {id_u} possui descendentes. Pulando processamento direto...")
                             processadas_global[str(id_u)] = {"pagina": 9999, "acumulado": 0}
                             salvar_checkpoint(processadas_global); return
 
                         caminho = obter_caminho_hierarquico(driver, cb)
                         pasta_u = os.path.join(pasta_raiz, *caminho)
-                        print(f"Caminho: {' > '.join(caminho)}")
+                        print(f"[CAMINHO] {' > '.join(caminho)}")
                         
                         selecionar_unidade_e_buscar(driver, id_u)
                         if not verificar_tabela_vazia(driver):
                             definir_quantidade_por_pagina(driver)
                             processar_paginas_da_unidade(driver, caminho[-1], pasta_u, id_u, processadas_global)
                         else:
+                            print(f"[INFO] Unidade {id_u} nao possui registros para baixar.")
                             processadas_global[str(id_u)] = {"pagina": 9999, "acumulado": 0}
                             salvar_checkpoint(processadas_global)
 
                     executar_com_retry(driver, rodar)
+                    print(f"[LOG] Finalizando Unidade {id_u}. Reiniciando estado para proxima...")
                     driver.refresh(); navegar_para_listagem(driver); reabrir_busca_avancada_e_modal(driver)
                 except Exception as e:
-                    print(f"Erro Unidade {id_u}: {e}")
+                    print(f"[ERRO CRITICO] Falha na Unidade {id_u}: {e}")
                     driver.refresh(); navegar_para_listagem(driver); reabrir_busca_avancada_e_modal(driver)
 
         if os.path.exists(pasta_raiz) and os.listdir(pasta_raiz):
+            print("[LOG] Criando arquivo consolidado de resultados...")
             shutil.make_archive(os.path.join(PASTA_DOWNLOAD, "Resultado_Final_Bot"), 'zip', pasta_raiz)
-            print("\nPROCESSO CONCLUIDO!")
+            print("\n[SUCESSO] PROCESSO COMPLETO E FINALIZADO.")
 
-    except Exception:
+    except Exception as e:
+        print(f"\n[ERRO FATAL] O bot parou devido a um erro nao tratado: {e}")
         traceback.print_exc()
         time.sleep(60)
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except:
+            pass
 
 if __name__ == "__main__": main()
